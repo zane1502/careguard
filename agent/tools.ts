@@ -19,6 +19,7 @@ import type { SpendingPolicy, Transaction } from "../shared/types.ts";
 import { SPENDING_TIMEZONE, getLocalDateStr } from "./tz.ts";
 export { SPENDING_TIMEZONE, getLocalDateStr };
 import { appendAuditEntry } from "../shared/audit-log.ts";
+import { Journal } from "./journal.ts";
 import {
   x402SettlementsTotal,
   paymentsUsdcTotal,
@@ -36,6 +37,7 @@ const DRUG_INTERACTION_API = process.env.DRUG_INTERACTION_API_URL || "http://loc
 const PHARMACY_PAYMENT_API = process.env.PHARMACY_PAYMENT_API_URL || "http://localhost:3005";
 const USDC_ISSUER = process.env.USDC_ISSUER || "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
 const HORIZON_URL = "https://horizon-testnet.stellar.org";
+const STELLAR_TIMEBOUNDS_SECONDS = parseInt(process.env.STELLAR_TIMEBOUNDS_SECONDS || "60", 10);
 
 if (!AGENT_SECRET_KEY) throw new Error("AGENT_SECRET_KEY required in .env");
 
@@ -60,7 +62,8 @@ async function submitTransactionWithRetry(
   server: Horizon.Server,
   tx: any,
   maxRetries = 2,
-  timeoutMs = 35000
+  timeoutMs = 35000,
+  rebuildTx?: () => Promise<any>
 ): Promise<any> {
   let lastError: any;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -69,10 +72,14 @@ async function submitTransactionWithRetry(
       return result;
     } catch (err: any) {
       lastError = err;
-      // Don't retry if the server responded with a transaction failure
       if (err?.response?.status) throw err;
-      // Don't retry if the transaction expired
       const msg = err?.message ?? "";
+      // tx_too_late: timebounds expired — retry once with fresh timebounds if rebuild fn provided
+      if (msg.includes("tx_too_late") && rebuildTx && attempt < maxRetries) {
+        logger.warn({ attempt: attempt + 1 }, "[Stellar] tx_too_late, rebuilding with fresh timebounds");
+        tx = await rebuildTx();
+        continue;
+      }
       if (msg.includes("tx_bad_seq") || msg.includes("tx_too_early") || msg.includes("tx_too_late")) throw err;
       if (attempt < maxRetries) {
         const delay = Math.pow(2, attempt) * 500;
@@ -122,9 +129,11 @@ const mppClient = Mppx.create({
   polyfill: false,
 });
 
-// --- Persistent spending tracker ---
+// --- Persistent spending tracker with append-only journal ---
 const DATA_DIR = new URL("../data", import.meta.url).pathname;
 const SPENDING_FILE = `${DATA_DIR}/spending.json`;
+const JOURNAL_FILE = `${DATA_DIR}/journal.jsonl`;
+const SNAPSHOT_FILE = `${DATA_DIR}/snapshot.json`;
 
 if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
 
@@ -135,13 +144,32 @@ interface SpendingTracker {
   transactions: Transaction[];
 }
 
+const journal = new Journal({
+  journalPath: JOURNAL_FILE,
+  snapshotPath: SNAPSHOT_FILE,
+  compactionThreshold: 100,
+});
+
 function loadSpending(): SpendingTracker {
-  if (!existsSync(SPENDING_FILE)) return { medications: 0, bills: 0, serviceFees: 0, transactions: [] };
-  return JSON.parse(readFileSync(SPENDING_FILE, "utf-8"));
+  // Legacy migration: if old spending file exists but no snapshot, migrate it
+  if (existsSync(SPENDING_FILE) && !existsSync(SNAPSHOT_FILE) && !existsSync(JOURNAL_FILE)) {
+    try {
+      const legacy = JSON.parse(readFileSync(SPENDING_FILE, "utf-8"));
+      journal.compact(legacy as Record<string, unknown>);
+      logger.info("[Journal] migrated legacy spending.json to journal");
+    } catch { /* ignore */ }
+  }
+
+  return journal.replay<SpendingTracker>(
+    { medications: 0, bills: 0, serviceFees: 0, transactions: [] },
+    {
+      spending_update: (_state, data) => data as SpendingTracker,
+    },
+  );
 }
 
 function saveSpending(data: SpendingTracker) {
-  writeFileSync(SPENDING_FILE, JSON.stringify(data, null, 2));
+  journal.append("spending_update", data);
 }
 
 let spendingTracker = loadSpending();
@@ -556,36 +584,41 @@ export async function payBill(providerId: string, providerName: string, descript
   let stellarTxHash: string | undefined;
 
   try {
-    const account = await horizonServer.loadAccount(agentKeypair.publicKey());
-    const usdcAsset = new Asset("USDC", USDC_ISSUER);
+    const buildStellarTx = async () => {
+      const account = await horizonServer.loadAccount(agentKeypair.publicKey());
+      const usdcAsset = new Asset("USDC", USDC_ISSUER);
 
-    const stellarTx = new TransactionBuilder(account, {
-      fee: "100",
-      networkPassphrase: Networks.TESTNET,
-    })
-      .addOperation(
-        Operation.payment({
-          destination: recipientKey,
-          asset: usdcAsset,
-          amount: amount.toFixed(7),
-        })
-      )
-      .setTimeout(30)
-      .build();
+      const stellarTx = new TransactionBuilder(account, {
+        fee: "100",
+        networkPassphrase: Networks.TESTNET,
+      })
+        .addOperation(
+          Operation.payment({
+            destination: recipientKey,
+            asset: usdcAsset,
+            amount: amount.toFixed(7),
+          })
+        )
+        .setTimeout(STELLAR_TIMEBOUNDS_SECONDS)
+        .build();
 
-    stellarTx.sign(agentKeypair);
+      stellarTx.sign(agentKeypair);
 
-    // Belt-and-braces: verify the signed envelope's signer hint matches the agent keypair
-    // before broadcast — cheap guard against future wallet mix-ups.
-    const sigHint = stellarTx.signatures[0]?.hint();
-    if (!sigHint || !sigHint.equals(agentKeypair.signatureHint())) {
-      throw new Error(
-        `Signer mismatch: expected ${agentKeypair.publicKey()} — refusing to submit`
-      );
-    }
+      // Belt-and-braces: verify the signed envelope's signer hint matches the agent keypair
+      // before broadcast — cheap guard against future wallet mix-ups.
+      const sigHint = stellarTx.signatures[0]?.hint();
+      if (!sigHint || !sigHint.equals(agentKeypair.signatureHint())) {
+        throw new Error(
+          `Signer mismatch: expected ${agentKeypair.publicKey()} — refusing to submit`
+        );
+      }
+      return stellarTx;
+    };
+
+    let stellarTx = await buildStellarTx();
     console.log(`  [Stellar] Signer verified: ${agentKeypair.publicKey().slice(0, 8)}...`);
 
-    const result = await submitTransactionWithRetry(horizonServer, stellarTx);
+    const result = await submitTransactionWithRetry(horizonServer, stellarTx, 2, 35000, buildStellarTx);
     stellarTxHash = result.hash;
     logger.info({ txHash: stellarTxHash }, "[Stellar] TX confirmed");
   } catch (err: any) {

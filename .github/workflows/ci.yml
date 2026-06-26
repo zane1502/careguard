@@ -28,6 +28,12 @@ jobs:
       - name: Run tests
         run: npm test
 
+      - name: Run evals (requires LLM_API_KEY)
+        if: secrets.LLM_API_KEY != ''
+        run: npx vitest run --include '**/evals/**/*.spec.{ts,tsx}'
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+
       - name: Security audit (high/critical)
         run: |
           npm audit --json 2>/dev/null | node -e "

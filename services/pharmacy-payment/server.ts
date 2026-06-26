@@ -89,7 +89,7 @@ const mppx = Mppx.create({
 app.post("/pharmacy/order", async (req, res) => {
   const { drug, pharmacy, amount } = req.body;
 
-  if (!drug || !pharmacy || !amount) {
+  if (!drug || !pharmacy || amount === undefined || amount === null) {
     res.status(400).json({ error: "Missing required fields: drug, pharmacy, amount" });
     return;
   }
