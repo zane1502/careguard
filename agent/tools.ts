@@ -1176,7 +1176,11 @@ export function checkSpendingPolicy(
     };
   }
 
-  const { dayStart, dayEnd } = getLocalDayBounds(SPENDING_TIMEZONE);
+  // Use the policy's per-recipient timezone if set; fall back to the global
+  // SPENDING_TIMEZONE env var so caregivers in non-UTC locales see the correct
+  // "today" boundary for their wall clock (Issue #207).
+  const effectiveTz = policy.timezone ?? SPENDING_TIMEZONE;
+  const { dayStart, dayEnd } = getLocalDayBounds(effectiveTz);
   const dayStartMs = dayStart.getTime();
   const dayEndMs = dayEnd.getTime();
   const totalToday = spendingTracker.transactions
