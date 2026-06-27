@@ -61,6 +61,7 @@ import {
 import { getPendingAdherences } from "../shared/adherence.ts";
 import { notify } from "../shared/notifications.ts";
 import { resolveStellarNetwork, validateSignerKeyForNetwork } from "../shared/stellar-network.ts";
+import { verifyWebhook } from "../shared/verify-webhook.ts";
 
 const PORT = parseInt(process.env.AGENT_PORT || "3004");
 
@@ -811,6 +812,23 @@ async function verifyWallet() {
     process.exit(1);
   }
 }
+
+// ── Stellar deposit webhook (stub) ────────────────────────────────────────────
+// Mounted with express.raw() so the middleware receives the unmodified body
+// bytes for HMAC verification.  Business logic (reconciliation, top-up) will
+// be added here once the Stellar Horizon webhook integration is live.
+app.post(
+  "/webhooks/stellar/deposit",
+  express.raw({ type: "application/json" }),
+  verifyWebhook(),
+  (req: express.Request, res: express.Response) => {
+    const payload = JSON.parse(
+      Buffer.isBuffer(req.body) ? req.body.toString("utf8") : String(req.body),
+    ) as Record<string, unknown>;
+    logger.info({ payload }, "stellar deposit webhook received");
+    res.status(200).json({ status: "received" });
+  },
+);
 
 app.use((err: any, _req: express.Request, res: express.Response, next: express.NextFunction) => {
   if (err.type === "entity.too.large") {

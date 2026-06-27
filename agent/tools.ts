@@ -624,6 +624,42 @@ export function saveSpending(data: SpendingTracker, recipientId?: string) {
 
 let spendingTracker = loadSpending();
 
+// --- Budget mutex (Issue #209) ---
+// Consistency model: per-process, per-recipient.
+//   Within a single Node.js process the mutex makes the check-and-reserve step
+//   atomic: no two concurrent payForMedication / payBill calls can both pass the
+//   budget check when only one slot remains.
+// Cross-process: if you run multiple server replicas sharing the same data
+//   directory, wrap the spending file read-modify-write with proper-lockfile
+//   (already a dependency) instead of this in-memory mutex.
+class AsyncMutex {
+  private _locked = false;
+  private _queue: Array<() => void> = [];
+
+  acquire(): Promise<() => void> {
+    return new Promise((resolve) => {
+      const release = () => {
+        const next = this._queue.shift();
+        if (next) next();
+        else this._locked = false;
+      };
+      if (this._locked) {
+        this._queue.push(() => resolve(release));
+      } else {
+        this._locked = true;
+        resolve(release);
+      }
+    });
+  }
+}
+
+const _budgetMutexes = new Map<string, AsyncMutex>();
+function getBudgetMutex(recipientId: string): AsyncMutex {
+  let m = _budgetMutexes.get(recipientId);
+  if (!m) { m = new AsyncMutex(); _budgetMutexes.set(recipientId, m); }
+  return m;
+}
+
 const MAX_PAYMENT = 1000;
 const MAX_ERROR_LENGTH = 500;
 
@@ -1496,66 +1532,125 @@ export async function payForMedication(
       error: `Invalid payment amount: $${amount}. Amount must be a positive finite number <= $${MAX_PAYMENT}.`,
     };
   }
-  const policyCheck = checkSpendingPolicy(
-    amount,
-    TRANSACTION_CATEGORY.MEDICATIONS,
-  );
-  if (!policyCheck.allowed) {
-    const reason = policyCheck.reason!.includes('daily')
-      ? 'daily_limit'
-      : 'budget';
-    policyBlocksTotal.inc({ reason });
-    
-    const tx = {
-      id: `tx-${Date.now()}`,
-      timestamp: new Date().toISOString(),
-      type: 'medication',
-      description: `${drugName} from ${pharmacyName}`,
+  // Atomically check policy and reserve the budget before the async payment
+  // check when only one slot remains in the budget.
+  const release = await getBudgetMutex(currentRecipientId).acquire();
+  let policyCheck: ReturnType<typeof checkSpendingPolicy>;
+  try {
+    policyCheck = checkSpendingPolicy(
       amount,
-      recipient: pharmacyId,
-      status: 'blocked',
-      category: TRANSACTION_CATEGORY.MEDICATIONS,
-    };
-    spendingTracker.transactions.push(tx);
-    appendTransaction(tx as any);
+      TRANSACTION_CATEGORY.MEDICATIONS,
+    );
+    if (!policyCheck.allowed) {
+      const reason = policyCheck.reason!.includes('daily')
+        ? 'daily_limit'
+        : 'budget';
+      policyBlocksTotal.inc({ reason });
+      
+      const tx = {
+        id: `tx-${Date.now()}`,
+        timestamp: new Date().toISOString(),
+        type: 'medication',
+        description: `${drugName} from ${pharmacyName}`,
+        amount,
+        recipient: pharmacyId,
+        status: 'blocked',
+        category: TRANSACTION_CATEGORY.MEDICATIONS,
+      };
+      spendingTracker.transactions.push(tx);
+      appendTransaction(tx as any);
 
-    return {
-      success: false,
-      error: `BLOCKED BY SPENDING POLICY: ${policyCheck.reason}`,
-      transaction: tx,
-    };
+      return {
+        success: false,
+        error: `BLOCKED BY SPENDING POLICY: ${policyCheck.reason}`,
+        transaction: tx,
+      };
+    }
+    if (policyCheck.requiresApproval && !skipApproval) {
+      policyBlocksTotal.inc({ reason: 'approval_required' });
+      const holdSeconds = (currentPolicy as any)?.holdTimeSeconds ?? 0;
+      const submittedAt = new Date().toISOString();
+      const pendingUntil = new Date(
+        Date.now() + holdSeconds * 1000,
+      ).toISOString();
+      const tx: Transaction & { pendingUntil?: string; submittedAt?: string } = {
+        id: `tx-${Date.now()}`,
+        timestamp: submittedAt,
+        type: 'medication',
+        description: `${drugName} from ${pharmacyName}`,
+        amount,
+        recipient: pharmacyId,
+        status: 'pending',
+        category: TRANSACTION_CATEGORY.MEDICATIONS,
+        pendingUntil,
+        submittedAt,
+      };
+      spendingTracker.transactions.push(tx);
+      agentTransactionsTotal.inc({ status: 'pending' });
+      // Append only the new pending transaction — O(1) write (Issue #205)
+      appendTransaction(tx);
+      return {
+        success: false,
+        error: `REQUIRES CAREGIVER APPROVAL: ${amount.toFixed(2)} exceeds the ${currentPolicy.approvalThreshold} approval threshold.`,
+        transaction: tx,
+      };
+    }
+    // Reserve the budget before releasing the mutex so no other concurrent call
+    // can observe the pre-payment balance and pass a check it should fail.
+    spendingTracker.medications += amount;
+  } finally {
+    release();
   }
-  if (policyCheck.requiresApproval && !skipApproval) {
-    policyBlocksTotal.inc({ reason: 'approval_required' });
-    const holdSeconds = (currentPolicy as any)?.holdTimeSeconds ?? 0;
-    const submittedAt = new Date().toISOString();
-    const pendingUntil = new Date(
-      Date.now() + holdSeconds * 1000,
-    ).toISOString();
-    const tx: Transaction & { pendingUntil?: string; submittedAt?: string } = {
-      id: `tx-${Date.now()}`,
-      timestamp: submittedAt,
-      type: 'medication',
-      description: `${drugName} from ${pharmacyName}`,
       amount,
-      recipient: pharmacyId,
-      status: 'pending',
-      category: TRANSACTION_CATEGORY.MEDICATIONS,
-      pendingUntil,
-      submittedAt,
-    };
-    spendingTracker.transactions.push(tx);
-    agentTransactionsTotal.inc({ status: 'pending' });
-    // Append only the new pending transaction — O(1) write (Issue #205)
-    appendTransaction(tx);
-    return {
-      success: false,
-      error: `REQUIRES CAREGIVER APPROVAL: $${amount.toFixed(2)} exceeds the $${currentPolicy.approvalThreshold} approval threshold.`,
-      transaction: tx,
-    };
+      TRANSACTION_CATEGORY.MEDICATIONS,
+    );
+    if (!policyCheck.allowed) {
+      const reason = policyCheck.reason!.includes('daily')
+        ? 'daily_limit'
+        : 'budget';
+      policyBlocksTotal.inc({ reason });
+      return {
+        success: false,
+        error: `BLOCKED BY SPENDING POLICY: ${policyCheck.reason}`,
+      };
+    }
+    if (policyCheck.requiresApproval && !skipApproval) {
+      policyBlocksTotal.inc({ reason: 'approval_required' });
+      const holdSeconds = (currentPolicy as any)?.holdTimeSeconds ?? 0;
+      const submittedAt = new Date().toISOString();
+      const pendingUntil = new Date(
+        Date.now() + holdSeconds * 1000,
+      ).toISOString();
+      const tx: Transaction & { pendingUntil?: string; submittedAt?: string } = {
+        id: `tx-${Date.now()}`,
+        timestamp: submittedAt,
+        type: 'medication',
+        description: `${drugName} from ${pharmacyName}`,
+        amount,
+        recipient: pharmacyId,
+        status: 'pending',
+        category: TRANSACTION_CATEGORY.MEDICATIONS,
+        pendingUntil,
+        submittedAt,
+      };
+      spendingTracker.transactions.push(tx);
+      agentTransactionsTotal.inc({ status: 'pending' });
+      // Append only the new pending transaction — O(1) write (Issue #205)
+      appendTransaction(tx);
+      return {
+        success: false,
+        error: `REQUIRES CAREGIVER APPROVAL: $${amount.toFixed(2)} exceeds the $${currentPolicy.approvalThreshold} approval threshold.`,
+        transaction: tx,
+      };
+    }
+    // Reserve the budget before releasing the mutex so no other concurrent call
+    // can observe the pre-payment balance and pass a check it should fail.
+    spendingTracker.medications += amount;
+  } finally {
+    release();
   }
 
-  // Execute real MPP charge payment to pharmacy
+  // Execute real MPP charge payment to pharmacy (outside the mutex — can be slow)
   const paymentResult = await executeMedicationPayment(
     pharmacyId,
     pharmacyName,
@@ -1563,6 +1658,8 @@ export async function payForMedication(
     amount,
   );
   if (!paymentResult.success) {
+    // Roll back the optimistic reservation on payment failure.
+    spendingTracker.medications -= amount;
     return paymentResult;
   }
 
@@ -1579,7 +1676,7 @@ export async function payForMedication(
     category: TRANSACTION_CATEGORY.MEDICATIONS,
   };
 
-  spendingTracker.medications += amount;
+  // medications was already incremented during the reservation step above.
   spendingTracker.transactions.push(tx);
   agentTransactionsTotal.inc({ status: 'completed' });
   agentSpendingUsd.set(
@@ -1626,66 +1723,79 @@ export async function payBill(
       error: `Invalid payment amount: $${amount}. Amount must be a positive finite number <= $${MAX_PAYMENT}.`,
     };
   }
-  const policyCheck = checkSpendingPolicy(amount, TRANSACTION_CATEGORY.BILLS);
-  if (!policyCheck.allowed) {
-    const reason = policyCheck.reason!.includes('daily')
-      ? 'daily_limit'
-      : 'budget';
-    policyBlocksTotal.inc({ reason });
-    
-    const tx = {
-      id: `tx-${Date.now()}`,
-      timestamp: new Date().toISOString(),
-      type: 'bill',
-      description: `${description} — ${providerName}`,
-      amount,
-      recipient: providerId,
-      status: 'blocked',
-      category: TRANSACTION_CATEGORY.BILLS,
-    };
-    spendingTracker.transactions.push(tx);
-    appendTransaction(tx as any);
+  // Atomically check policy and reserve the budget before the async payment
+  // (Issue #209).
+  const releaseBill = await getBudgetMutex(currentRecipientId).acquire();
+  let billPolicyCheck: ReturnType<typeof checkSpendingPolicy>;
+  try {
+    billPolicyCheck = checkSpendingPolicy(amount, TRANSACTION_CATEGORY.BILLS);
+    if (!billPolicyCheck.allowed) {
+      const reason = billPolicyCheck.reason!.includes('daily')
+        ? 'daily_limit'
+        : 'budget';
+      policyBlocksTotal.inc({ reason });
+      
+      const tx = {
+        id: `tx-${Date.now()}`,
+        timestamp: new Date().toISOString(),
+        type: 'bill',
+        description: `${description} — ${providerName}`,
+        amount,
+        recipient: providerId,
+        status: 'blocked',
+        category: TRANSACTION_CATEGORY.BILLS,
+      };
+      spendingTracker.transactions.push(tx);
+      appendTransaction(tx as any);
 
-    return {
-      success: false,
-      error: `BLOCKED BY SPENDING POLICY: ${policyCheck.reason}`,
-      transaction: tx,
-    };
+      return {
+        success: false,
+        error: `BLOCKED BY SPENDING POLICY: ${billPolicyCheck.reason}`,
+        transaction: tx,
+      };
+    }
+    if (billPolicyCheck.requiresApproval && !skipApproval) {
+      policyBlocksTotal.inc({ reason: 'approval_required' });
+      const holdSeconds = (currentPolicy as any)?.holdTimeSeconds ?? 0;
+      const submittedAt = new Date().toISOString();
+      const pendingUntil = new Date(
+        Date.now() + holdSeconds * 1000,
+      ).toISOString();
+      const tx: Transaction & { pendingUntil?: string; submittedAt?: string } = {
+        id: `tx-${Date.now()}`,
+        timestamp: submittedAt,
+        type: 'bill',
+        description: `${description} — ${providerName}`,
+        amount,
+        recipient: providerId,
+        status: 'pending',
+        category: TRANSACTION_CATEGORY.BILLS,
+        pendingUntil,
+        submittedAt,
+      };
+      spendingTracker.transactions.push(tx);
+      agentTransactionsTotal.inc({ status: 'pending' });
+      // Append only the new pending transaction — O(1) write (Issue #205)
+      appendTransaction(tx);
+      return {
+        success: false,
+        error: `REQUIRES CAREGIVER APPROVAL: ${amount.toFixed(2)} exceeds the ${currentPolicy.approvalThreshold} approval threshold.`,
+        transaction: tx,
+      };
+    }
+    // Reserve the budget before releasing the mutex.
+    spendingTracker.bills += amount;
+  } finally {
+    releaseBill();
   }
-  if (policyCheck.requiresApproval && !skipApproval) {
-    policyBlocksTotal.inc({ reason: 'approval_required' });
-    const holdSeconds = (currentPolicy as any)?.holdTimeSeconds ?? 0;
-    const submittedAt = new Date().toISOString();
-    const pendingUntil = new Date(
-      Date.now() + holdSeconds * 1000,
-    ).toISOString();
-    const tx: Transaction & { pendingUntil?: string; submittedAt?: string } = {
-      id: `tx-${Date.now()}`,
-      timestamp: submittedAt,
-      type: 'bill',
-      description: `${description} — ${providerName}`,
-      amount,
-      recipient: providerId,
-      status: 'pending',
-      category: TRANSACTION_CATEGORY.BILLS,
-      pendingUntil,
-      submittedAt,
-    };
-    spendingTracker.transactions.push(tx);
-    agentTransactionsTotal.inc({ status: 'pending' });
-    // Append only the new pending transaction — O(1) write (Issue #205)
-    appendTransaction(tx);
-    return {
-      success: false,
-      error: `REQUIRES CAREGIVER APPROVAL: $${amount.toFixed(2)} exceeds the $${currentPolicy.approvalThreshold} approval threshold.`,
-      transaction: tx,
-    };
   }
 
-  // Execute real Stellar USDC transfer
+  // Execute real Stellar USDC transfer (outside the mutex — can be slow)
   const recipientKey = process.env.BILL_PROVIDER_PUBLIC_KEY;
-  if (!recipientKey)
+  if (!recipientKey) {
+    spendingTracker.bills -= amount; // roll back reservation
     return { success: false, error: 'BILL_PROVIDER_PUBLIC_KEY not configured' };
+  }
 
   logger.info(
     { provider: providerName, amount },
@@ -1735,6 +1845,7 @@ export async function payBill(
     stellarTxSubmittedTotal.inc({ result: 'error' });
     const errorDetail =
       err?.response?.data?.extras?.result_codes || err.message;
+    spendingTracker.bills -= amount; // roll back reservation on Stellar failure
     return {
       success: false,
       error: `Stellar USDC transfer failed: ${JSON.stringify(errorDetail)}`,
@@ -1756,7 +1867,7 @@ export async function payBill(
     category: TRANSACTION_CATEGORY.BILLS,
   };
 
-  spendingTracker.bills += amount;
+  // bills was already incremented during the reservation step above.
   spendingTracker.transactions.push(tx);
   agentTransactionsTotal.inc({ status: 'completed' });
   agentSpendingUsd.set({ category: TRANSACTION_CATEGORY.BILLS }, spendingTracker.bills);
