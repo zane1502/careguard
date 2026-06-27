@@ -5,7 +5,7 @@ import "@testing-library/jest-dom/vitest";
 // Silence pino output in tests
 process.env.LOG_LEVEL = "silent";
 process.env.CAREGIVER_TOKEN = process.env.CAREGIVER_TOKEN || "test-caregiver-token";
-process.env.AGENT_SECRET_KEY = process.env.AGENT_SECRET_KEY || "SAKYNUBM36I4L6H5X2B7QYY46X2F52BNV25SHT2R6S3N7J4D4FMM5XQ6";
+process.env.AGENT_SECRET_KEY = process.env.AGENT_SECRET_KEY || "SDISLXAAQIOJ6Q33X5NPGZ632RRAPHX52MHMTDJTVSOH2UV5AHNMICXT";
 process.env.MOCK_NETWORK = "1";
 process.env.STELLAR_NETWORK = "testnet";
 process.env.PHARMACY_1_PUBLIC_KEY = process.env.PHARMACY_1_PUBLIC_KEY || "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
